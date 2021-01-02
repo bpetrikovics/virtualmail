@@ -1,0 +1,503 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Config::IniFiles;
+
+use DBI;
+use Getopt::Long;
+
+die 'HOME environment variable not set or not pointing to a directory'
+	unless (-d $ENV{HOME});
+
+my $CFGDATA = Config::IniFiles->new(-file => "$ENV{HOME}/.config/mailadmin/config.in")
+	or die('Could not open configuration file. Maybe you should create one?');
+
+my $MIN_UID    = $CFGDATA->val('System', 'MIN_UID');
+my $SYSTEM_GID = $CFGDATA->val('System', 'SYSTEM_GID');
+my $VM_PATH    = $CFGDATA->val('System', 'VM_PATH');
+
+my $PWLEN      = $CFGDATA->val('System', 'PWLEN');
+my $PWGEN_OPTIONS = "-c -n $PWLEN 1";
+my $PWGEN = `which pwgen`; chomp $PWGEN;
+die "[ERR] No pwgen binary found on PATH"
+	unless $PWGEN;
+
+my $DBNAME = $CFGDATA->val('Database', 'DBNAME');
+my $DBHOST = $CFGDATA->val('Database', 'DBHOST');
+my $DBUSER = $CFGDATA->val('Database', 'DBUSER');
+my $DBPASS = $CFGDATA->val('Database', 'DBPASS');
+
+print "[INFO] Using database: $DBNAME\n";
+my $dbh = DBI->connect("DBI:mysql:database=$DBNAME;host=$DBHOST", $DBUSER, $DBPASS) || die "Cannot connect to database";
+
+die help()
+	unless $ARGV[1];
+
+my $command = $ARGV[0] . "_" . $ARGV[1];
+
+{
+	no strict 'refs';
+	if (exists(&{ $command })) {
+		&{ $command }()
+	} else {
+		print "[ERR] Undefined command $command\n";
+	}
+}
+
+# --- Helpers
+
+sub help{
+	return<<EOF;
+USAGE: $0 <command> <modifier> [arguments]
+
+Valid commands and modifiers are:
+
+Command  Modifier  Arguments
+-------  --------  ---------
+list
+         domains
+         aliases
+         users
+         karma
+add
+         domain     -name, -type [local(default), relay], -relayhost
+         alias      -alias, -type [site(default, system], -to
+         user       -address
+         karma      -ip, -score [int(default=12)]
+delete
+         domain     -id, -domain
+         alias      -id, -alias
+         user       -id, -address
+         karma      -ip, -cleanup
+
+E.G.:
+  $0 add domain -name domain.com
+  $0 add alias -alias user\@domain1.com -to user\@domain2.com
+  $0 add user -address user\@domain.com
+
+NOTE:
+  - Domains can be local (this is the default) or relay. Local domains are accepting the mails
+    locally, while relay domains are accepting them even if we are not the MX for them; if relayhost
+    is specified, then mail will be relayed there, otherwise MX records will be used to look it up.
+  - Aliases can be site-specific (default) or system-wide. A site alias is in user\@domain format
+    while system-wide aliases only contain a username, which will be applied to any domains served by
+    the server.
+  - Users (mailboxes) must be specified in user\@domain format. The mailbox logins will be created in the
+    same format.
+
+EOF
+}
+
+sub get_next_uid {
+	my $max = $MIN_UID - 1;
+
+	my $sth = $dbh->prepare("SELECT uid FROM users ORDER BY ID");
+	$sth->execute();
+
+	while (my $row = $sth->fetchrow_hashref()) {
+		if ($row->{uid} == $max + 1) {
+			$max++;
+		} elsif ($max == $row->{uid}) {
+			print "[WARN] Duplicate uid found: " . $row->{uid} . "\n";
+		}	else {
+			print "[WARN] Unused uid (gap) found: " . ($max + 1) . "\n";
+			return $max + 1;
+		}
+	}
+	print "[INFO] Next uid:  " . ($max+1) . "\n";
+	return $max+1;
+}
+
+sub record_exists {
+	my $table = shift;
+	my $conditions = shift;
+
+	die "[ERR] record_exists() did not get all expected arguments"
+		unless (defined($table) and defined($conditions));
+
+	die "[ERR] Table name contains illegal characters"
+		if $table =~ /[^a-z]/;
+
+	# argument check
+	foreach my $k (keys %{$conditions}) {
+		print "[INFO] record_exists arg check: '$k' = '$conditions->{$k}'\n";
+
+		die "[ERR] Field name contains illegal characters"
+			if $k =~ /[^a-zA-Z]/;
+
+		die "[ERR] Value contains illegal characters"
+			if $conditions->{$k} =~ /[^a-zA-Z0-9\.\-\_\@]/;
+	}
+
+	# assemble the arrays that will be used to form the SQL select
+	my @sqlextra = map { "$_=?" } keys %{ $conditions };
+	my @values   = map {  $conditions->{$_} } keys %{ $conditions };
+
+	my $SQL = "SELECT * FROM $table WHERE ";
+
+	$SQL .= join " AND ", @sqlextra;
+	print "[INFO] $SQL\n";
+	my $sth = $dbh->prepare($SQL);
+
+	$sth->execute(@values);
+
+	my $cnt = 0;
+	my @found;
+	while (my $row = $sth->fetchrow_hashref()) {
+		$cnt++;
+		push @found, $row->{ID}
+	}
+
+	print "[INFO] record_exists: $cnt items found (@found)\n";
+	return $cnt;
+}
+
+# --- Functions/Commands
+
+# ------ List
+
+sub list_aliases {
+	my $sth = $dbh->prepare("SELECT * FROM aliases");
+	$sth->execute();
+	while (my $row = $sth->fetchrow_hashref()) {
+		printf("[%-4d] %-6s %s -> %s\n",
+			$row->{ID},
+			$row->{type},
+			$row->{type} eq "system" ? $row->{username} : $row->{username} . "@" . $row->{domainname},
+			$row->{sendto}
+			);
+	}
+}
+
+sub list_domains {
+	my $sth = $dbh->prepare("SELECT * FROM domains");
+	$sth->execute();
+	while (my $row = $sth->fetchrow_hashref()) {
+		printf("[%-4d] %-5s %s %s\n",
+			$row->{ID},
+			$row->{type},
+			$row->{domainname},
+			$row->{relayhost} eq "" ? "" : "->" . $row->{relayhost}
+		);
+	}
+}
+
+sub list_users {
+	my $sth = $dbh->prepare("SELECT * FROM users");
+	$sth->execute();
+	while (my $row = $sth->fetchrow_hashref()) {
+		printf("[%-6d] %5d,%-2d %s@%s\n",
+			$row->{ID},
+			$row->{uid},
+			$row->{gid},
+			$row->{localpart},
+			$row->{hostpart},
+		);
+	}
+}
+
+sub list_karma {
+  my $sth = $dbh->prepare("SELECT INET_NTOA(sender_host_address) AS host, score, active, created FROM karma ORDER BY score");
+	$sth->execute();
+	while (my $row = $sth->fetchrow_hashref()) {
+		printf(
+			"%-15s %3d %1s %s\n",
+			$row->{host},
+			$row->{score},
+			$row->{active} ? "A" : "D",
+			$row->{created}
+		);
+	}
+ }
+
+# ------ Add
+
+sub add_domain {
+	my $domainname ="";
+	my $type = "local";
+	my $relayhost = "";
+
+	# add domain bigyo.com -type local
+	# add domain bigyo.com -type relay -relayhost whatever.com
+	GetOptions(
+		"name=s"      => \$domainname,
+		"type=s"      => \$type,
+		"relayhost=s" => \$relayhost,
+	) or die "GetOptions failed";
+
+	die "[ERR] Domain type can be either local or relay"
+		unless ($type eq "local" or $type eq "relay");
+
+	die "[ERR] Need -name to specify domainname"
+    unless $domainname;
+
+	die "[ERR] Specified domain already exists"
+		if record_exists("domains", { domainname => $domainname });
+
+	my $sth = $dbh->prepare("INSERT INTO domains (ID, domainname, type, relayhost, ctime)
+		VALUES(NULL, ?, ?, ?, NOW())");
+	$sth->execute($domainname, $type, $relayhost);
+
+	print "Done.\n";
+}
+
+sub add_alias {
+	my $alias = "";
+	my $type = "site";
+	my $target = "";
+
+  # add alias -alias user1@domain1.com -type site -to user2@domain2.com
+	# add alias -alias hostmaster -type system -to root
+	GetOptions(
+		"alias=s" => \$alias,
+		"type=s"  => \$type,
+	  "to=s"    => \$target,
+	) or die "GetOptions failed";
+
+	die "[ERR] Alias name must be specified with -alias"
+		unless $alias;
+
+	die "[ERR] Target must be specified with -to"
+		unless $target;
+
+	# Alias will be user@domain for a "site" entry and just username for "system"
+	my ($a_user, $a_domain) = split "\@", $alias;
+	$a_domain = "" unless defined($a_domain);
+
+	die "[ERR] System alias must not have a domain part"
+		if ($type eq "system" and $a_domain ne "");
+
+	die "[ERR] Site alias must have a domain part"
+		if ($type eq "site" and $a_domain eq "");
+
+	die "[ERR] Trying to create site alias for a non-existant domain"
+		if ($a_domain ne "" and !record_exists("domains", { "domainname" => $a_domain}));
+
+	die "[ERR] The given alias already exists"
+		if record_exists("aliases", { "username" => $a_user, "domainname" => $a_domain });
+
+	my $sth = $dbh->prepare("INSERT INTO aliases (ID, username, domainname, sendto, type, ctime)
+		VALUES (NULL, ?, ?, ?, ?, NOW())");
+	$sth->execute($a_user, $a_domain, $target, $type);
+
+	print "Done.\n";
+}
+
+# this will only allow to add users with login set to user@pass
+sub add_user {
+	my $address = "";
+
+	# add user -address user@domain.com
+	GetOptions(
+		"address=s" => \$address,
+	) or die "GetOptions failed";
+
+	die "[ERR] Mailbox address must be specified with -address"
+		unless $address;
+
+	my ($u_user, $u_host) = split "\@", $address;
+
+	die "[ERR] The given mailbox already exists"
+		if record_exists("users", { "login" => $address });
+
+	die "[ERR] The given mailbox already exists"
+		if record_exists("users", { "localpart" => $u_user, "hostpart" => $u_host});
+
+	my $pw = `$PWGEN $PWGEN_OPTIONS`; chomp $pw;
+	my $statement = "INSERT INTO users
+	(login, localpart, hostpart, cryptpass, realname, uid, gid, maildir)
+	VALUES (?, ?, ?, encrypt(?, CONCAT(?, SUBSTRING(MD5(RAND()),1,16))), ?, ?, ?, ?)";
+
+	my $sth = $dbh->prepare($statement);
+	
+	$sth->execute(
+		$address,
+		$u_user,
+		$u_host,
+		$pw,
+		'$6$',
+		$u_user,
+		get_next_uid(),
+		$SYSTEM_GID,
+		"$VM_PATH/$u_host/$u_user/Maildir",
+	);
+
+	print "[INFO] Created with password: $pw\n";
+}
+
+sub add_karma {
+	my $ip = "";
+	my $score = 12;
+
+	GetOptions(
+		"ip=s" => \$ip,
+		"score=i" => \$score
+	);
+
+	if ($score == 0 or $score < 0) {
+		$score = 12;
+	}
+
+	print "[INFO] ip=$ip, score=$score\n";
+
+	my $sth = $dbh->prepare("INSERT INTO karma (sender_host_address, score) VALUES (INET_ATON(?), ?)");
+	$sth->execute(
+		$ip,
+		$score
+	);
+}
+
+# ------ Delete
+
+sub delete_domain {
+	my $id = "";
+	my $domain = "";
+
+	# delete domain -id 34
+	# delete domain -domain whatever.com
+	GetOptions(
+		"id=i"     => \$id,
+		"domain=s" => \$domain,
+	) or die "GetOptions failed";
+
+	die "[ERR] Need to specify domain either by -id or -domain"
+		unless ($id ne "" or $domain ne "");
+
+	die "[ERR] Don't specify both -id and -domain"
+		if ($id ne "" and $domain ne "");
+
+	die "[ERR] The specified domain does not exist in database"
+		if (
+			($id ne ""     and !record_exists("domains", { "ID" => $id })) or
+			($domain ne "" and !record_exists("domains", { "domainname" => $domain  }))
+		);
+
+		my $SQL = "DELETE FROM domains WHERE ";
+		if ($id ne "") {
+			$SQL .= "ID=?";
+		} else {
+			$SQL .= "domainname=?";
+		}
+
+		my $sth = $dbh->prepare($SQL);
+		$sth->execute($id ne "" ? $id : $domain);
+
+		print "Done.\n";
+}
+
+sub delete_alias {
+	my $id = "";
+	my $alias = "";
+
+	# delete alias -id 32
+	# delete alias -alias someone
+	# delete alias -alias someone@somewhere.com
+	GetOptions(
+		"id=i"  => \$id,
+		"alias=s" => \$alias,
+	) or die "GetOptions failed";
+
+	die "[ERR] Need to specify domain either by -id or -alias"
+		unless ($id ne "" or $alias ne "");
+
+	die "[ERR] Don't specify both -id and -alias"
+	  if ($id ne "" and $alias ne "");
+
+	my ($a_user, $a_domain) = split "\@", $alias;
+
+	die "[ERR] The specified alias does not exist in database"
+		if (
+			($id ne ""     and !record_exists("aliases", { "ID" => $id })) or
+			# a_domain can be empty so to avoid sending "undef", explicitly wrap it into a string...
+			($alias ne ""  and !record_exists("aliases", { "username" => $a_user, "domainname" => "$a_domain" }))
+		);
+
+	my $SQL = "DELETE FROM aliases WHERE ";
+	if ($id ne "") {
+		$SQL .= "ID=?";
+	} else {
+		$SQL .= "username=? AND domainname=?";
+	}
+
+	print "[INFO] $SQL\n";
+	my $sth = $dbh->prepare($SQL);
+	$sth->execute($id ne "" ? $id : ($a_user, "$a_domain"));
+
+	print "Done.\n";
+}
+
+sub delete_user {
+	my $id = "";
+	my $address = "";
+
+	# delete user -id 32
+	# delete user -address what@ever.com
+	GetOptions(
+		"id=i"      => \$id,
+		"address=s" => \$address,
+	) or die "GetOptions failed";
+
+	die "[ERR] Need to specify domain either by -id or -address"
+	  unless ($id ne "" or $address ne "");
+
+	die "[ERR] Don't specify both -id and -address"
+		if ($id ne "" and $address ne "");
+
+	my ($u_user, $u_host) = split "\@", $address;
+
+	die "[ERR] The specified mailbox does not exist in database"
+		if (
+			($id ne ""      and !record_exists("users", { "ID" => $id })) or
+			($address ne "" and !record_exists("users", { "localpart" => $u_user, "hostpart" => $u_host}))
+		);
+
+	my $SQL = "DELETE FROM users WHERE ";
+	if ($id ne "") {
+		$SQL .= "ID=?";
+	}else {
+		 $SQL .= "localpart=? AND hostpart=?";
+	}
+
+	print "[INFO] $SQL\n";
+	my $sth = $dbh->prepare($SQL);
+	$sth->execute($id ne "" ? $id : ($u_user, $u_host));
+
+	print "Done.\n";
+}
+
+sub delete_karma {
+	my $ip = "";
+	my $cleanup = 0;
+	my $days = 0;
+	my $sth;
+
+	GetOptions(
+		"ip=s" => \$ip,
+		"cleanup" => \$cleanup,
+		"days=i" => \$days
+	);
+
+	if ($cleanup) {
+		print "[INFO] cleanup mode\n";
+
+		if ($days) {
+			print "[INFO] deleting karma records older than $days days\n";
+			# cannot use bind param for function arguments as it will put quotes around it, which mysql won't accept
+			$sth = $dbh->prepare("DELETE FROM karma WHERE created < DATE_SUB(NOW(), INTERVAL $days DAY)");
+		} else {
+			$sth = $dbh->prepare("DELETE FROM karma WHERE score < 5 AND created < DATE_SUB(NOW(), INTERVAL 24 HOUR)");
+		}
+		$sth->execute();
+	} else {
+		print "[INFO] ip=$ip\n";
+
+		$sth = $dbh->prepare("DELETE FROM karma WHERE INET_NTOA(sender_host_address)=?");
+		$sth->execute(
+			$ip
+		);
+	}
+}
+
+# ------ Update/Modify
