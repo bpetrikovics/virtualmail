@@ -1,12 +1,12 @@
 [Database]
-DBHOST => "localhost"
-DBNAME => "virtualdb"
-DBUSER => "someuser"
-DBPASS => "somepass"
+DBHOST="localhost"
+DBNAME="virtualdb"
+DBUSER="someuser"
+DBPASS="somepass"
 
 [System]
-MIN_UID => 10000
-SYSTEM_GID => 8
-VM_PATH => "/var/spool/virtualmail"
-PWLEN => 10
+MIN_UID=10000
+SYSTEM_GID=8
+VM_PATH="/var/spool/virtualmail"
+PWLEN=10
 

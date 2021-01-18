@@ -11,7 +11,7 @@ use Getopt::Long;
 die 'HOME environment variable not set or not pointing to a directory'
 	unless (-d $ENV{HOME});
 
-my $CFGDATA = Config::IniFiles->new(-file => "$ENV{HOME}/.config/mailadmin/config.in")
+my $CFGDATA = Config::IniFiles->new(-file => "$ENV{HOME}/.config/mailadmin/config.ini")
 	or die('Could not open configuration file. Maybe you should create one?');
 
 my $MIN_UID    = $CFGDATA->val('System', 'MIN_UID');
